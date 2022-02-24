@@ -25,13 +25,23 @@ describe("files", () => {
     expect(deserialized).to.deep.equal(metadata);
   });
 
-  it("finishUpload persists file to memory", () => {
+  it("should store file in memory when upload is finalized", () => {
     const storageLayer = new StorageLayer("project");
-    const { uploadId } = storageLayer.startUpload("bucket", "object", "mime/type", {
+    const upload = storageLayer.startUpload("bucket", "object", "mime/type", {
       contentType: "mime/type",
     });
-    storageLayer.uploadBytes(uploadId, Buffer.alloc(0));
-    storageLayer.finishUpload(uploadId);
+    storageLayer.uploadBytes(upload.uploadId, Buffer.alloc(0));
+    storageLayer.finalizeUpload(upload);
     expect(storageLayer.getMetadata("bucket", "object")).not.to.equal(undefined);
+  });
+
+  it("should delete file from persistence layer when upload is cancelled", () => {
+    const storageLayer = new StorageLayer("project");
+    const upload = storageLayer.startUpload("bucket", "object", "mime/type", {
+      contentType: "mime/type",
+    });
+    storageLayer.uploadBytes(upload.uploadId, Buffer.alloc(0));
+    storageLayer.cancelUpload(upload);
+    expect(storageLayer.getMetadata("bucket", "object")).to.equal(undefined);
   });
 });
