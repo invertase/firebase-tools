@@ -401,7 +401,8 @@ export class FunctionsEmulator implements EmulatorInstance {
   async sendRequest(trigger: EmulatedTriggerDefinition, body?: any) {
     const record = this.getTriggerRecordByKey(this.getTriggerKey(trigger));
     const pool = this.workerPools[record.backend.codebase];
-    if (!pool.readyForWork(trigger.id)) {
+    const runtime = record.backend.runtime;
+    if (!pool.readyForWork(trigger.id, runtime)) {
       try {
         await this.startRuntime(record.backend, trigger);
       } catch (e: any) {
@@ -409,7 +410,7 @@ export class FunctionsEmulator implements EmulatorInstance {
         return;
       }
     }
-    const worker = pool.getIdleWorker(trigger.id)!;
+    const worker = pool.getIdleWorker(trigger.id, runtime)!;
     if (this.debugMode) {
       await worker.sendDebugMsg({
         functionTarget: trigger.entryPoint,
@@ -421,11 +422,18 @@ export class FunctionsEmulator implements EmulatorInstance {
       "Content-Type": "application/json",
       "Content-Length": `${reqBody.length}`,
     };
+
+    // For Dart, include the function name in the path so the server can route
+    // For other runtimes, use / as they use FUNCTION_TARGET env var
+    const isDart = runtime?.startsWith("dart");
+    const path = isDart ? `/${trigger.entryPoint}` : `/`;
+
     return new Promise((resolve, reject) => {
       const req = http.request(
         {
           ...worker.runtime.conn.httpReqOpts(),
-          path: `/`,
+          method: "POST",
+          path: path,
           headers: headers,
         },
         resolve,
@@ -475,14 +483,22 @@ export class FunctionsEmulator implements EmulatorInstance {
         `Watching "${backend.functionsDir}" for Cloud Functions...`,
       );
 
-      const watcher = chokidar.watch(backend.functionsDir, {
-        ignored: [
-          /.+?[\\\/]node_modules[\\\/].+?/, // Ignore node_modules
-          /(^|[\/\\])\../, // Ignore files which begin the a period
-          /.+\.log/, // Ignore files which have a .log extension
-          /.+?[\\\/]venv[\\\/].+?/, // Ignore site-packages in venv
-          ...(backend.ignore?.map((i) => `**/${i}`) ?? []),
-        ],
+      // For Dart runtimes, watch only the YAML spec file since Dart handles its own hot reload
+      const isDart = backend.runtime?.startsWith("dart");
+      const watchPath = isDart
+        ? path.join(backend.functionsDir, ".dart_tool", "firebase", "functions.yaml")
+        : backend.functionsDir;
+
+      const watcher = chokidar.watch(watchPath, {
+        ignored: isDart
+          ? [] // For Dart, we're watching a specific file, so no ignore patterns needed
+          : [
+              /.+?[\\\/]node_modules[\\\/].+?/, // Ignore node_modules
+              /(^|[\/\\])\../, // Ignore files which begin the a period
+              /.+\.log/, // Ignore files which have a .log extension
+              /.+?[\\\/]venv[\\\/].+?/, // Ignore site-packages in venv
+              ...(backend.ignore?.map((i) => `**/${i}`) ?? []),
+            ],
         persistent: true,
       });
 
@@ -1670,6 +1686,59 @@ export class FunctionsEmulator implements EmulatorInstance {
     };
   }
 
+  async startDart(
+    backend: EmulatableBackend,
+    envs: Record<string, string>,
+  ): Promise<FunctionsRuntimeInstance> {
+    if (this.debugMode) {
+      this.logger.log("WARN", "--inspect-functions not supported for Dart functions. Ignored.");
+    }
+
+    // Use TCP/IP stack for Dart, similar to Python
+    const port = await portfinder.getPortPromise({
+      port: 8081 + randomInt(0, 1000), // Add a small jitter to avoid race condition.
+    });
+
+    const args = ["--enable-vm-service", "lib/main.dart"];
+
+    // For Dart, don't set FUNCTION_TARGET in environment - the server loads all functions
+    // and routes based on the request path (similar to Python's functions-framework)
+    const dartEnvs = { ...envs };
+    delete dartEnvs.FUNCTION_TARGET;
+    delete dartEnvs.FUNCTION_SIGNATURE_TYPE;
+
+    const bin = backend.bin || "dart";
+    logger.debug(
+      `Starting Dart runtime with args: ${args.join(" ")} on port ${port}`,
+    );
+    const childProcess = spawn(bin, args, {
+      cwd: backend.functionsDir,
+      env: {
+        ...process.env,
+        ...dartEnvs,
+        HOST: "127.0.0.1",
+        PORT: port.toString(),
+      },
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+
+    // Log stdout and stderr for debugging
+    childProcess.stdout?.on("data", (chunk: Buffer) => {
+      this.logger.log("DEBUG", `[dart] ${chunk.toString("utf8")}`);
+    });
+
+    childProcess.stderr?.on("data", (chunk: Buffer) => {
+      this.logger.log("DEBUG", `[dart] ${chunk.toString("utf8")}`);
+    });
+
+    return {
+      process: childProcess,
+      events: new EventEmitter(),
+      cwd: backend.functionsDir,
+      conn: new TCPConn("127.0.0.1", port),
+    };
+  }
+
   async startRuntime(
     backend: EmulatableBackend,
     trigger?: EmulatedTriggerDefinition,
@@ -1680,6 +1749,8 @@ export class FunctionsEmulator implements EmulatorInstance {
     let runtime;
     if (backend.runtime!.startsWith("python")) {
       runtime = await this.startPython(backend, { ...runtimeEnv, ...secretEnvs });
+    } else if (backend.runtime!.startsWith("dart")) {
+      runtime = await this.startDart(backend, { ...runtimeEnv, ...secretEnvs });
     } else {
       runtime = await this.startNode(backend, { ...runtimeEnv, ...secretEnvs });
     }
@@ -1689,7 +1760,7 @@ export class FunctionsEmulator implements EmulatorInstance {
     };
 
     const pool = this.workerPools[backend.codebase];
-    const worker = pool.addWorker(trigger, runtime, extensionLogInfo);
+    const worker = pool.addWorker(trigger, runtime, extensionLogInfo, backend.runtime);
     await worker.waitForSocketReady();
     return worker;
   }
@@ -1835,10 +1906,18 @@ export class FunctionsEmulator implements EmulatorInstance {
     // To match production behavior we need to drop the path prefix
     // req.url = /:projectId/:region/:trigger_name/*
     const url = new URL(`${req.protocol}://${req.hostname}${req.url}`);
-    const path = `${url.pathname}${url.search}`.replace(
+    let path = `${url.pathname}${url.search}`.replace(
       new RegExp(`\/${this.args.projectId}\/[^\/]*\/${req.params.trigger_name}\/?`),
       "/",
     );
+
+    // For Dart, include the function name in the path so the server can route
+    // Python's functions-framework uses FUNCTION_TARGET env var, but Dart loads all functions
+    const isDart = record.backend.runtime?.startsWith("dart");
+    if (isDart && path === "/") {
+      // Include function name in path for Dart routing
+      path = `/${trigger.entryPoint}`;
+    }
 
     // We do this instead of just 302'ing because many HTTP clients don't respect 302s so it may
     // cause unexpected situations - not to mention CORS troubles and this enables us to use
@@ -1846,7 +1925,8 @@ export class FunctionsEmulator implements EmulatorInstance {
     this.logger.log("DEBUG", `[functions] Got req.url=${req.url}, mapping to path=${path}`);
 
     const pool = this.workerPools[record.backend.codebase];
-    if (!pool.readyForWork(trigger.id)) {
+    const runtime = record.backend.runtime;
+    if (!pool.readyForWork(trigger.id, runtime)) {
       try {
         await this.startRuntime(record.backend, trigger);
       } catch (e: any) {
@@ -1875,6 +1955,7 @@ export class FunctionsEmulator implements EmulatorInstance {
       res as http.ServerResponse,
       reqBody,
       debugBundle,
+      runtime,
     );
   }
 }

@@ -173,6 +173,10 @@ async function languageSetup(setup: any, config: Config): Promise<any> {
       name: "Python",
       value: "python",
     },
+    {
+      name: "Dart",
+      value: "dart",
+    },
   ];
   const language = await select({
     message: "What language would you like to use to write Cloud Functions?",
@@ -204,6 +208,18 @@ async function languageSetup(setup: any, config: Config): Promise<any> {
       // In practical sense, latest supported runtime will not be a decomissioned runtime,
       // but in theory this doesn't have to be the case.
       cbconfig.runtime = supported.latest("python") as supported.ActiveRuntime;
+      break;
+    case "dart":
+      cbconfig.ignore = [
+        ".dart_tool",
+        ".git",
+        "firebase-debug.log",
+        "firebase-debug.*.log",
+        "*.local",
+      ];
+      // In practical sense, latest supported runtime will not be a decomissioned runtime,
+      // but in theory this doesn't have to be the case.
+      cbconfig.runtime = supported.latest("dart") as supported.ActiveRuntime;
       break;
   }
   setup.functions.languageChoice = language;
