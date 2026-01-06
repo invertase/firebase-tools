@@ -1,7 +1,6 @@
 import * as fs from "fs";
 import * as path from "path";
 import { promisify } from "util";
-import { ChildProcess } from "child_process";
 import * as spawn from "cross-spawn";
 
 import * as runtimes from "..";
@@ -75,72 +74,8 @@ export class Delegate implements runtimes.RuntimeDelegate {
   }
 
   watch(): Promise<() => Promise<void>> {
-    const dartRunProcess = spawn(this.bin, ["run", this.sourceDir], {
-      cwd: this.sourceDir,
-      stdio: ["ignore", "pipe", "pipe"],
-    });
-
-    const buildRunnerProcess = spawn(this.bin, ["run", "build_runner", "watch", "-d"], {
-      cwd: this.sourceDir,
-      stdio: ["ignore", "pipe", "pipe"],
-    });
-
-    // Log output from both processes
-    dartRunProcess.stdout?.on("data", (chunk: Buffer) => {
-      logger.info(`[dart run] ${chunk.toString("utf8")}`);
-    });
-    dartRunProcess.stderr?.on("data", (chunk: Buffer) => {
-      logger.error(`[dart run] ${chunk.toString("utf8")}`);
-    });
-
-    buildRunnerProcess.stdout?.on("data", (chunk: Buffer) => {
-      logger.info(`[build_runner] ${chunk.toString("utf8")}`);
-    });
-    buildRunnerProcess.stderr?.on("data", (chunk: Buffer) => {
-      logger.error(`[build_runner] ${chunk.toString("utf8")}`);
-    });
-
-    // Return cleanup function
-    return Promise.resolve(async () => {
-      const killProcess = (proc: ChildProcess) => {
-        if (!proc.killed && proc.exitCode === null) {
-          proc.kill("SIGTERM");
-        }
-      };
-
-      // Try graceful shutdown first
-      killProcess(dartRunProcess);
-      killProcess(buildRunnerProcess);
-
-      // Wait a bit for graceful shutdown
-      await new Promise((resolve) => setTimeout(resolve, 2000));
-
-      // Force kill if still running
-      if (!dartRunProcess.killed && dartRunProcess.exitCode === null) {
-        dartRunProcess.kill("SIGKILL");
-      }
-      if (!buildRunnerProcess.killed && buildRunnerProcess.exitCode === null) {
-        buildRunnerProcess.kill("SIGKILL");
-      }
-
-      // Wait for both processes to exit
-      await Promise.all([
-        new Promise<void>((resolve) => {
-          if (dartRunProcess.killed || dartRunProcess.exitCode !== null) {
-            resolve();
-          } else {
-            dartRunProcess.once("exit", () => resolve());
-          }
-        }),
-        new Promise<void>((resolve) => {
-          if (buildRunnerProcess.killed || buildRunnerProcess.exitCode !== null) {
-            resolve();
-          } else {
-            buildRunnerProcess.once("exit", () => resolve());
-          }
-        }),
-      ]);
-    });
+    // No-op: The FunctionsEmulator handles build_runner watch for hot reload
+    return Promise.resolve(() => Promise.resolve());
   }
 
   async discoverBuild(

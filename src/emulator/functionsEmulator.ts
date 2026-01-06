@@ -224,6 +224,7 @@ export class FunctionsEmulator implements EmulatorInstance {
   private staticBackends: EmulatableBackend[] = [];
   private dynamicBackends: EmulatableBackend[] = [];
   private watchers: chokidar.FSWatcher[] = [];
+  private buildRunnerProcesses: Map<string, ChildProcess> = new Map();
 
   debugMode = false;
 
@@ -475,6 +476,61 @@ export class FunctionsEmulator implements EmulatorInstance {
     return Promise.resolve();
   }
 
+  /**
+   * Starts build_runner in watch mode for a Dart backend.
+   * This watches Dart source files and regenerates functions.yaml when they change.
+   */
+  private startBuildRunnerWatch(backend: EmulatableBackend): void {
+    const bin = backend.bin || "dart";
+    const codebase = backend.codebase;
+
+    this.logger.logLabeled(
+      "BULLET",
+      "functions",
+      `Starting build_runner watch for Dart functions...`,
+    );
+
+    const buildRunnerProcess = spawn(bin, ["run", "build_runner", "watch", "--delete-conflicting-outputs"], {
+      cwd: backend.functionsDir,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+
+    buildRunnerProcess.stdout?.on("data", (chunk: Buffer) => {
+      const output = chunk.toString("utf8").trim();
+      if (output) {
+        this.logger.log("DEBUG", `[build_runner] ${output}`);
+      }
+    });
+
+    buildRunnerProcess.stderr?.on("data", (chunk: Buffer) => {
+      const output = chunk.toString("utf8").trim();
+      if (output) {
+        this.logger.log("DEBUG", `[build_runner] ${output}`);
+      }
+    });
+
+    buildRunnerProcess.on("exit", (code) => {
+      if (code !== 0 && code !== null) {
+        this.logger.logLabeled(
+          "WARN",
+          "functions",
+          `build_runner exited with code ${code}. Hot reload may not work.`,
+        );
+      }
+      this.buildRunnerProcesses.delete(codebase);
+    });
+
+    buildRunnerProcess.on("error", (err) => {
+      this.logger.logLabeled(
+        "WARN",
+        "functions",
+        `Failed to start build_runner: ${err.message}`,
+      );
+    });
+
+    this.buildRunnerProcesses.set(codebase, buildRunnerProcess);
+  }
+
   async connect(): Promise<void> {
     for (const backend of this.staticBackends) {
       this.logger.logLabeled(
@@ -483,15 +539,26 @@ export class FunctionsEmulator implements EmulatorInstance {
         `Watching "${backend.functionsDir}" for Cloud Functions...`,
       );
 
-      // For Dart runtimes, watch only the YAML spec file since Dart handles its own hot reload
-      const isDart = backend.runtime?.startsWith("dart");
-      const watchPath = isDart
-        ? path.join(backend.functionsDir, ".dart_tool", "firebase", "functions.yaml")
-        : backend.functionsDir;
+      // First load triggers to discover the runtime type
+      await this.loadTriggers(backend, /* force= */ true);
 
-      const watcher = chokidar.watch(watchPath, {
+      // Now we can check if it's Dart (runtime is set by loadTriggers -> discoverTriggers)
+      const isDart = backend.runtime?.startsWith("dart");
+      this.logger.log("DEBUG", `Runtime: ${backend.runtime}, isDart: ${isDart}`);
+
+      // For Dart runtimes, start build_runner watch to regenerate functions.yaml on source changes
+      if (isDart) {
+        this.startBuildRunnerWatch(backend);
+      }
+      const watcher = chokidar.watch(backend.functionsDir, {
         ignored: isDart
-          ? [] // For Dart, we're watching a specific file, so no ignore patterns needed
+          ? [
+              /.+?[\\\/]\.dart_tool[\\\/].+?/, // Ignore .dart_tool (build outputs)
+              /.+?[\\\/]\.packages/, // Ignore .packages
+              /.+?[\\\/]build[\\\/].+?/, // Ignore build directory
+              /(^|[\/\\])\../, // Ignore hidden files
+              /.+\.log/, // Ignore log files
+            ]
           : [
               /.+?[\\\/]node_modules[\\\/].+?/, // Ignore node_modules
               /(^|[\/\\])\../, // Ignore files which begin the a period
@@ -504,13 +571,45 @@ export class FunctionsEmulator implements EmulatorInstance {
 
       this.watchers.push(watcher);
 
-      const debouncedLoadTriggers = debounce(() => this.loadTriggers(backend), 1000);
-      watcher.on("change", (filePath) => {
-        this.logger.log("DEBUG", `File ${filePath} changed, reloading triggers`);
-        return debouncedLoadTriggers();
+      // Log when watcher is ready
+      watcher.on("ready", () => {
+        this.logger.log("DEBUG", `File watcher ready for ${backend.functionsDir}`);
       });
 
-      await this.loadTriggers(backend, /* force= */ true);
+      if (isDart) {
+        // For Dart, reload triggers and refresh workers when source files change
+        const debouncedReload = debounce(async () => {
+          this.logger.logLabeled("BULLET", "functions", "Source file changed, reloading...");
+          // Re-discover triggers in case function signatures changed (build_runner updates functions.yaml)
+          await this.loadTriggers(backend);
+        }, 1000);
+        watcher.on("change", (filePath) => {
+          this.logger.log("DEBUG", `Detected change: ${filePath}`);
+          return debouncedReload();
+        });
+
+        // Also watch functions.yaml specifically - when build_runner regenerates it,
+        // we need to reload to discover new/changed function signatures
+        const functionsYamlPath = path.join(backend.functionsDir, ".dart_tool", "firebase", "functions.yaml");
+        const yamlWatcher = chokidar.watch(functionsYamlPath, { persistent: true });
+        this.watchers.push(yamlWatcher);
+
+        const debouncedYamlReload = debounce(async () => {
+          this.logger.logLabeled("BULLET", "functions", "Function definitions changed, reloading...");
+          await this.loadTriggers(backend);
+        }, 500);
+        yamlWatcher.on("change", () => {
+          this.logger.log("DEBUG", "functions.yaml changed");
+          return debouncedYamlReload();
+        });
+      } else {
+        // For Node.js/Python, re-discover triggers on change
+        const debouncedLoadTriggers = debounce(() => this.loadTriggers(backend), 1000);
+        watcher.on("change", (filePath) => {
+          this.logger.log("DEBUG", `File ${filePath} changed, reloading triggers`);
+          return debouncedLoadTriggers();
+        });
+      }
     }
     await this.performPostLoadOperations();
     return;
@@ -536,6 +635,15 @@ export class FunctionsEmulator implements EmulatorInstance {
       await watcher.close();
     }
     this.watchers = [];
+
+    // Stop all build_runner processes for Dart backends
+    for (const [codebase, proc] of this.buildRunnerProcesses) {
+      this.logger.log("DEBUG", `Stopping build_runner for ${codebase}`);
+      if (!proc.killed && proc.exitCode === null) {
+        proc.kill("SIGTERM");
+      }
+    }
+    this.buildRunnerProcesses.clear();
 
     if (this.destroyServer) {
       await this.destroyServer();
