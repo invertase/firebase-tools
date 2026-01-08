@@ -479,8 +479,9 @@ export class FunctionsEmulator implements EmulatorInstance {
   /**
    * Starts build_runner in watch mode for a Dart backend.
    * This watches Dart source files and regenerates functions.yaml when they change.
+   * Returns a promise that resolves when the initial build completes.
    */
-  private startBuildRunnerWatch(backend: EmulatableBackend): void {
+  private startBuildRunnerWatch(backend: EmulatableBackend): Promise<void> {
     const bin = backend.bin || "dart";
     const codebase = backend.codebase;
 
@@ -495,10 +496,31 @@ export class FunctionsEmulator implements EmulatorInstance {
       stdio: ["ignore", "pipe", "pipe"],
     });
 
+    // Track whether initial build has completed
+    let initialBuildComplete = false;
+    let resolveInitialBuild: () => void;
+    let rejectInitialBuild: (err: Error) => void;
+
+    const initialBuildPromise = new Promise<void>((resolve, reject) => {
+      resolveInitialBuild = resolve;
+      rejectInitialBuild = reject;
+    });
+
     buildRunnerProcess.stdout?.on("data", (chunk: Buffer) => {
       const output = chunk.toString("utf8").trim();
       if (output) {
         this.logger.log("DEBUG", `[build_runner] ${output}`);
+
+        // Check if initial build completed (look for "Succeeded after" message)
+        if (!initialBuildComplete && output.includes("Succeeded after")) {
+          initialBuildComplete = true;
+          this.logger.logLabeled(
+            "SUCCESS",
+            "functions",
+            `build_runner initial build completed`,
+          );
+          resolveInitialBuild();
+        }
       }
     });
 
@@ -516,6 +538,9 @@ export class FunctionsEmulator implements EmulatorInstance {
           "functions",
           `build_runner exited with code ${code}. Hot reload may not work.`,
         );
+        if (!initialBuildComplete) {
+          rejectInitialBuild(new Error(`build_runner exited with code ${code}`));
+        }
       }
       this.buildRunnerProcesses.delete(codebase);
     });
@@ -526,9 +551,14 @@ export class FunctionsEmulator implements EmulatorInstance {
         "functions",
         `Failed to start build_runner: ${err.message}`,
       );
+      if (!initialBuildComplete) {
+        rejectInitialBuild(err);
+      }
     });
 
     this.buildRunnerProcesses.set(codebase, buildRunnerProcess);
+
+    return initialBuildPromise;
   }
 
   async connect(): Promise<void> {
@@ -547,8 +577,9 @@ export class FunctionsEmulator implements EmulatorInstance {
       this.logger.log("DEBUG", `Runtime: ${backend.runtime}, isDart: ${isDart}`);
 
       // For Dart runtimes, start build_runner watch to regenerate functions.yaml on source changes
+      // Wait for initial build to complete before continuing (to ensure functions.yaml exists)
       if (isDart) {
-        this.startBuildRunnerWatch(backend);
+        await this.startBuildRunnerWatch(backend);
       }
       const watcher = chokidar.watch(backend.functionsDir, {
         ignored: isDart
