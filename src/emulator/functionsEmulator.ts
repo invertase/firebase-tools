@@ -512,7 +512,7 @@ export class FunctionsEmulator implements EmulatorInstance {
         this.logger.log("DEBUG", `[build_runner] ${output}`);
 
         // Check if initial build completed (look for "Succeeded after" message)
-        if (!initialBuildComplete && output.includes("Succeeded after")) {
+        if (!initialBuildComplete && output.includes("Built with")) {
           initialBuildComplete = true;
           this.logger.logLabeled(
             "SUCCESS",
