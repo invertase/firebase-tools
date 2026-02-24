@@ -3,7 +3,6 @@ import * as path from "path";
 import * as express from "express";
 import * as clc from "colorette";
 import * as http from "http";
-import * as jwt from "jsonwebtoken";
 import * as cors from "cors";
 import * as semver from "semver";
 import { URL } from "url";
@@ -28,7 +27,6 @@ import {
   FunctionsRuntimeFeatures,
   getFunctionService,
   getSignatureType,
-  HttpConstants,
   ParsedTriggerDefinition,
   emulatedFunctionsFromEndpoints,
   emulatedFunctionsByRegion,
@@ -62,7 +60,7 @@ import { BlockingFunctionsConfig } from "../gcp/identityPlatform";
 import { resolveBackend } from "../deploy/functions/build";
 import { getCredentialsEnvironment, setEnvVarsForEmulators } from "./env";
 import { runWithVirtualEnv } from "../functions/python";
-import { Runtime } from "../deploy/functions/runtimes/supported";
+import { isLanguageRuntime, Runtime } from "../deploy/functions/runtimes/supported";
 import { ExtensionsEmulator } from "./extensionsEmulator";
 
 const EVENT_INVOKE_GA4 = "functions_invoke"; // event name GA4 (alphanumertic)
@@ -224,7 +222,7 @@ export class FunctionsEmulator implements EmulatorInstance {
   private staticBackends: EmulatableBackend[] = [];
   private dynamicBackends: EmulatableBackend[] = [];
   private watchers: chokidar.FSWatcher[] = [];
-  private buildRunnerProcesses: Map<string, ChildProcess> = new Map();
+  private watchCleanups: Array<() => Promise<void>> = [];
 
   debugMode = false;
 
@@ -426,7 +424,7 @@ export class FunctionsEmulator implements EmulatorInstance {
 
     // For Dart, include the function name in the path so the server can route
     // For other runtimes, use / as they use FUNCTION_TARGET env var
-    const isDart = runtime?.startsWith("dart");
+    const isDart = isLanguageRuntime(runtime, "dart");
     const path = isDart ? `/${trigger.name}` : `/`;
 
     return new Promise((resolve, reject) => {
@@ -476,91 +474,6 @@ export class FunctionsEmulator implements EmulatorInstance {
     return Promise.resolve();
   }
 
-  /**
-   * Starts build_runner in watch mode for a Dart backend.
-   * This watches Dart source files and regenerates functions.yaml when they change.
-   * Returns a promise that resolves when the initial build completes.
-   */
-  private startBuildRunnerWatch(backend: EmulatableBackend): Promise<void> {
-    const bin = backend.bin || "dart";
-    const codebase = backend.codebase;
-
-    this.logger.logLabeled(
-      "BULLET",
-      "functions",
-      `Starting build_runner watch for Dart functions...`,
-    );
-
-    const buildRunnerProcess = spawn(bin, ["run", "build_runner", "watch", "--delete-conflicting-outputs"], {
-      cwd: backend.functionsDir,
-      stdio: ["ignore", "pipe", "pipe"],
-    });
-
-    // Track whether initial build has completed
-    let initialBuildComplete = false;
-    let resolveInitialBuild: () => void;
-    let rejectInitialBuild: (err: Error) => void;
-
-    const initialBuildPromise = new Promise<void>((resolve, reject) => {
-      resolveInitialBuild = resolve;
-      rejectInitialBuild = reject;
-    });
-
-    buildRunnerProcess.stdout?.on("data", (chunk: Buffer) => {
-      const output = chunk.toString("utf8").trim();
-      if (output) {
-        this.logger.log("DEBUG", `[build_runner] ${output}`);
-
-        // Check if initial build completed (look for "Succeeded after" message)
-        if (!initialBuildComplete && output.includes("Built with")) {
-          initialBuildComplete = true;
-          this.logger.logLabeled(
-            "SUCCESS",
-            "functions",
-            `build_runner initial build completed`,
-          );
-          resolveInitialBuild();
-        }
-      }
-    });
-
-    buildRunnerProcess.stderr?.on("data", (chunk: Buffer) => {
-      const output = chunk.toString("utf8").trim();
-      if (output) {
-        this.logger.log("DEBUG", `[build_runner] ${output}`);
-      }
-    });
-
-    buildRunnerProcess.on("exit", (code) => {
-      if (code !== 0 && code !== null) {
-        this.logger.logLabeled(
-          "WARN",
-          "functions",
-          `build_runner exited with code ${code}. Hot reload may not work.`,
-        );
-        if (!initialBuildComplete) {
-          rejectInitialBuild(new Error(`build_runner exited with code ${code}`));
-        }
-      }
-      this.buildRunnerProcesses.delete(codebase);
-    });
-
-    buildRunnerProcess.on("error", (err) => {
-      this.logger.logLabeled(
-        "WARN",
-        "functions",
-        `Failed to start build_runner: ${err.message}`,
-      );
-      if (!initialBuildComplete) {
-        rejectInitialBuild(err);
-      }
-    });
-
-    this.buildRunnerProcesses.set(codebase, buildRunnerProcess);
-
-    return initialBuildPromise;
-  }
-
   async connect(): Promise<void> {
     for (const backend of this.staticBackends) {
       this.logger.logLabeled(
@@ -572,75 +485,46 @@ export class FunctionsEmulator implements EmulatorInstance {
       // First load triggers to discover the runtime type
       await this.loadTriggers(backend, /* force= */ true);
 
-      // Now we can check if it's Dart (runtime is set by loadTriggers -> discoverTriggers)
-      const isDart = backend.runtime?.startsWith("dart");
-      this.logger.log("DEBUG", `Runtime: ${backend.runtime}, isDart: ${isDart}`);
+      const isDart = isLanguageRuntime(backend.runtime, "dart");
 
-      // For Dart runtimes, start build_runner watch to regenerate functions.yaml on source changes
-      // Wait for initial build to complete before continuing (to ensure functions.yaml exists)
+      // For Dart, start build_runner watch via the delegate's watch() method.
+      // This waits for the initial build to complete before continuing.
       if (isDart) {
-        await this.startBuildRunnerWatch(backend);
+        const runtimeDelegateContext: runtimes.DelegateContext = {
+          projectId: this.args.projectId,
+          projectDir: this.args.projectDir,
+          sourceDir: backend.functionsDir,
+          runtime: backend.runtime,
+        };
+        const delegate = await runtimes.getRuntimeDelegate(runtimeDelegateContext);
+        this.logger.logLabeled(
+          "BULLET",
+          "functions",
+          `Starting build_runner watch for Dart functions...`,
+        );
+        const cleanup = await delegate.watch();
+        this.watchCleanups.push(cleanup);
+        this.logger.logLabeled("SUCCESS", "functions", `build_runner initial build completed`);
       }
+
       const watcher = chokidar.watch(backend.functionsDir, {
-        ignored: isDart
-          ? [
-              /.+?[\\\/]\.dart_tool[\\\/].+?/, // Ignore .dart_tool (build outputs)
-              /.+?[\\\/]\.packages/, // Ignore .packages
-              /.+?[\\\/]build[\\\/].+?/, // Ignore build directory
-              /(^|[\/\\])\../, // Ignore hidden files
-              /.+\.log/, // Ignore log files
-            ]
-          : [
-              /.+?[\\\/]node_modules[\\\/].+?/, // Ignore node_modules
-              /(^|[\/\\])\../, // Ignore files which begin the a period
-              /.+\.log/, // Ignore files which have a .log extension
-              /.+?[\\\/]venv[\\\/].+?/, // Ignore site-packages in venv
-              ...(backend.ignore?.map((i) => `**/${i}`) ?? []),
-            ],
+        ignored: [
+          /(^|[\/\\])\../, // Ignore hidden files/dirs (covers .dart_tool, .git, etc.)
+          /.+\.log/, // Ignore log files
+          /.+?[\\\/]node_modules[\\\/].+?/, // Ignore node_modules
+          /.+?[\\\/]venv[\\\/].+?/, // Ignore venv
+          ...(backend.ignore?.map((i) => `**/${i}`) ?? []),
+        ],
         persistent: true,
       });
 
       this.watchers.push(watcher);
 
-      // Log when watcher is ready
-      watcher.on("ready", () => {
-        this.logger.log("DEBUG", `File watcher ready for ${backend.functionsDir}`);
+      const debouncedLoadTriggers = debounce(() => this.loadTriggers(backend), 1000);
+      watcher.on("change", (filePath) => {
+        this.logger.log("DEBUG", `File ${filePath} changed, reloading triggers`);
+        return debouncedLoadTriggers();
       });
-
-      if (isDart) {
-        // For Dart, reload triggers and refresh workers when source files change
-        const debouncedReload = debounce(async () => {
-          this.logger.logLabeled("BULLET", "functions", "Source file changed, reloading...");
-          // Re-discover triggers in case function signatures changed (build_runner updates functions.yaml)
-          await this.loadTriggers(backend);
-        }, 1000);
-        watcher.on("change", (filePath) => {
-          this.logger.log("DEBUG", `Detected change: ${filePath}`);
-          return debouncedReload();
-        });
-
-        // Also watch functions.yaml specifically - when build_runner regenerates it,
-        // we need to reload to discover new/changed function signatures
-        const functionsYamlPath = path.join(backend.functionsDir, "functions.yaml");
-        const yamlWatcher = chokidar.watch(functionsYamlPath, { persistent: true });
-        this.watchers.push(yamlWatcher);
-
-        const debouncedYamlReload = debounce(async () => {
-          this.logger.logLabeled("BULLET", "functions", "Function definitions changed, reloading...");
-          await this.loadTriggers(backend);
-        }, 500);
-        yamlWatcher.on("change", () => {
-          this.logger.log("DEBUG", "functions.yaml changed");
-          return debouncedYamlReload();
-        });
-      } else {
-        // For Node.js/Python, re-discover triggers on change
-        const debouncedLoadTriggers = debounce(() => this.loadTriggers(backend), 1000);
-        watcher.on("change", (filePath) => {
-          this.logger.log("DEBUG", `File ${filePath} changed, reloading triggers`);
-          return debouncedLoadTriggers();
-        });
-      }
     }
     await this.performPostLoadOperations();
     return;
@@ -667,14 +551,11 @@ export class FunctionsEmulator implements EmulatorInstance {
     }
     this.watchers = [];
 
-    // Stop all build_runner processes for Dart backends
-    for (const [codebase, proc] of this.buildRunnerProcesses) {
-      this.logger.log("DEBUG", `Stopping build_runner for ${codebase}`);
-      if (!proc.killed && proc.exitCode === null) {
-        proc.kill("SIGTERM");
-      }
+    // Stop delegate watch processes (e.g., build_runner for Dart)
+    for (const cleanup of this.watchCleanups) {
+      await cleanup();
     }
-    this.buildRunnerProcesses.clear();
+    this.watchCleanups = [];
 
     if (this.destroyServer) {
       await this.destroyServer();
@@ -1847,9 +1728,7 @@ export class FunctionsEmulator implements EmulatorInstance {
     delete dartEnvs.FUNCTION_SIGNATURE_TYPE;
 
     const bin = backend.bin || "dart";
-    logger.debug(
-      `Starting Dart runtime with args: ${args.join(" ")} on port ${port}`,
-    );
+    logger.debug(`Starting Dart runtime with args: ${args.join(" ")} on port ${port}`);
     const childProcess = spawn(bin, args, {
       cwd: backend.functionsDir,
       env: {
@@ -1886,9 +1765,9 @@ export class FunctionsEmulator implements EmulatorInstance {
     const secretEnvs = await this.resolveSecretEnvs(backend, trigger);
 
     let runtime;
-    if (backend.runtime!.startsWith("python")) {
+    if (isLanguageRuntime(backend.runtime, "python")) {
       runtime = await this.startPython(backend, { ...runtimeEnv, ...secretEnvs });
-    } else if (backend.runtime!.startsWith("dart")) {
+    } else if (isLanguageRuntime(backend.runtime, "dart")) {
       runtime = await this.startDart(backend, { ...runtimeEnv, ...secretEnvs });
     } else {
       runtime = await this.startNode(backend, { ...runtimeEnv, ...secretEnvs });
@@ -1942,41 +1821,6 @@ export class FunctionsEmulator implements EmulatorInstance {
     return EmulatorRegistry.getInfo(emulator);
   }
 
-  private tokenFromAuthHeader(authHeader: string) {
-    const match = /^Bearer (.*)$/.exec(authHeader);
-    if (!match) {
-      return;
-    }
-
-    let idToken = match[1];
-    logger.debug(`ID Token: ${idToken}`);
-
-    // The @firebase/testing library sometimes produces JWTs with invalid padding, so we
-    // remove that via regex. This is the spec that says trailing = should be removed:
-    // https://tools.ietf.org/html/rfc7515#section-2
-    if (idToken && idToken.includes("=")) {
-      idToken = idToken.replace(/[=]+?\./g, ".");
-      logger.debug(`ID Token contained invalid padding, new value: ${idToken}`);
-    }
-
-    try {
-      const decoded = jwt.decode(idToken, { complete: true }) as any;
-      if (!decoded || typeof decoded !== "object") {
-        logger.debug(`Failed to decode ID Token: ${decoded}`);
-        return;
-      }
-
-      // In firebase-functions we manually copy 'sub' to 'uid'
-      // https://github.com/firebase/firebase-admin-node/blob/0b2082f1576f651e75069e38ce87e639c25289af/src/auth/token-verifier.ts#L249
-      const claims = decoded.payload as jwt.JwtPayload;
-      claims.uid = claims.sub;
-
-      return claims;
-    } catch (e: any) {
-      return;
-    }
-  }
-
   private async handleHttpsTrigger(req: express.Request, res: express.Response) {
     const method = req.method;
     let triggerId: string = req.params.trigger_name;
@@ -2014,27 +1858,6 @@ export class FunctionsEmulator implements EmulatorInstance {
       }
     }
 
-    // For callable functions we want to accept tokens without actually calling verifyIdToken
-    const isCallable = trigger.labels && trigger.labels["deployment-callable"] === "true";
-    const authHeader = req.header("Authorization");
-    if (authHeader && isCallable && trigger.platform !== "gcfv2" && trigger.platform !== "run") {
-      const token = this.tokenFromAuthHeader(authHeader);
-      if (token) {
-        const contextAuth = {
-          uid: token.uid,
-          token: token,
-        };
-
-        // Stash the "Authorization" header in a temporary place, we will replace it
-        // when invoking the callable handler
-        req.headers[HttpConstants.ORIGINAL_AUTH_HEADER] = req.headers["authorization"];
-        delete req.headers["authorization"];
-
-        req.headers[HttpConstants.CALLABLE_AUTH_HEADER] = encodeURIComponent(
-          JSON.stringify(contextAuth),
-        );
-      }
-    }
     // For analytics, track the invoked service
     void trackEmulator(EVENT_INVOKE_GA4, {
       function_service: getFunctionService(trigger),
@@ -2053,7 +1876,7 @@ export class FunctionsEmulator implements EmulatorInstance {
     // For Dart, route via path since all functions share a single process.
     // The Dart server routes based on the first path segment (function name).
     // Use trigger_name (e.g. "helloWorld") not trigger.id (e.g. "us-central1-helloWorld").
-    const isDart = record.backend.runtime?.startsWith("dart");
+    const isDart = isLanguageRuntime(record.backend.runtime, "dart");
     if (isDart) {
       path = `/${req.params.trigger_name}${path === "/" ? "" : path}`;
     }

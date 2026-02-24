@@ -4,9 +4,7 @@ import { confirm } from "../../../prompt";
 import { latest } from "../../../deploy/functions/runtimes/supported";
 
 // TODO(ehesp): Create these template files in templates/init/functions/dart/
-// For now, we'll use basic templates
-// TODO(ehesp): Dont use relative path
-// TODO(ehesp): Should 
+// TODO(ehesp): Dont use relative path for firebase_functions
 const PUBSPEC_TEMPLATE = `name: functions
 description: Firebase Functions for Dart
 version: 1.0.0
@@ -17,14 +15,12 @@ environment:
 dependencies:
   firebase_functions:
     path: ../
-  shelf:
 
 dev_dependencies:
   build_runner: ^2.4.0
 `;
 
 const MAIN_TEMPLATE = `import 'package:firebase_functions/firebase_functions.dart';
-import 'package:shelf/shelf.dart';
 
 void main(List<String> args) {
   fireUp(args, (firebase) {
@@ -41,7 +37,6 @@ void main(List<String> args) {
 
 const GITIGNORE_TEMPLATE = `.dart_tool/
 build/
-.dart_tool/
 *.dart.js
 *.info.json
 *.js
@@ -57,10 +52,7 @@ firebase-debug.*.log
  * Create a Dart Firebase Functions project.
  */
 export async function setup(setup: any, config: Config): Promise<void> {
-  await config.askWriteProjectFile(
-    `${setup.functions.source}/pubspec.yaml`,
-    PUBSPEC_TEMPLATE,
-  );
+  await config.askWriteProjectFile(`${setup.functions.source}/pubspec.yaml`, PUBSPEC_TEMPLATE);
   await config.askWriteProjectFile(`${setup.functions.source}/.gitignore`, GITIGNORE_TEMPLATE);
   await config.askWriteProjectFile(`${setup.functions.source}/lib/main.dart`, MAIN_TEMPLATE);
 
@@ -84,4 +76,3 @@ export async function setup(setup: any, config: Config): Promise<void> {
     });
   }
 }
-
